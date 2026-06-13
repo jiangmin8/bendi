@@ -1,0 +1,74 @@
+# ============================================================
+# Prometheus 告警规则
+# ============================================================
+
+groups:
+  # ------------------
+  # llama-server 服务告警
+  # ------------------
+  - name: llama-server
+    rules:
+      # 服务宕机
+      - alert: LlamaServerDown
+        expr: up{job="llama-server"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "llama-server 服务不可用"
+          description: "llama-server 已连续 1 分钟无响应"
+
+      # 高延迟 (P95 > 30s)
+      - alert: LlamaServerHighLatency
+        expr: histogram_quantile(0.95, http_request_duration_seconds_bucket{job="llama-server"}) > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "llama-server 响应延迟过高"
+          description: "P95 延迟超过 30 秒，当前值: {{ $value }}s"
+
+      # 请求错误率过高
+      - alert: LlamaServerHighErrorRate
+        expr: rate(http_requests_total{job="llama-server",status=~"5.."}[5m]) / rate(http_requests_total{job="llama-server"}[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "llama-server 错误率过高"
+          description: "5xx 错误率超过 10%"
+
+      # Token 生成速率异常下降
+      - alert: LlamaServerLowTokenRate
+        expr: rate(llama:tokens_predicted_total[5m]) < 1
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "Token 生成速率低"
+          description: "过去 10 分钟 token 生成速率低于 1 token/s"
+
+  # ------------------
+  # 资源使用告警
+  # ------------------
+  - name: resources
+    rules:
+      # 高内存使用
+      - alert: HighMemoryUsage
+        expr: (container_memory_usage_bytes{name="llama-server"} / container_spec_memory_limit_bytes{name="llama-server"}) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "llama-server 内存使用过高"
+          description: "内存使用率超过 90%"
+
+      # GPU 显存不足（需 nvidia_gpu_exporter）
+      - alert: GPUMemoryHigh
+        expr: (nvidia_gpu_memory_used_bytes / nvidia_gpu_memory_total_bytes) > 0.9
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "GPU 显存不足"
+          description: "GPU 显存使用率超过 90%，可能导致 OOM"

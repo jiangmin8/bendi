@@ -1,0 +1,18 @@
+# ============================================================
+# Grafana Dashboard 配置
+# 自动挂载到 /etc/grafana/provisioning/dashboards/
+# ============================================================
+
+apiVersion: 1
+
+providers:
+  - name: 'llama-server-dashboards'
+    orgId: 1
+    folder: 'LLM Inference'
+    folderUid: ''
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards

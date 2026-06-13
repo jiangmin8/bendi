@@ -1,0 +1,6 @@
+# 模型转换依赖 (convert_hf_to_gguf.py)
+torch>=2.0.0
+transformers>=4.40.0
+sentencepiece
+protobuf
+numpy

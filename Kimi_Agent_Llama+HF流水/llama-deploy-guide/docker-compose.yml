@@ -1,0 +1,160 @@
+version: '3.8'
+
+# ============================================================
+# Llama.cpp + Hugging Face 完整部署编排
+# 用法:
+#   HF_TOKEN=your_token docker-compose up -d
+#   ./deploy.sh start
+# ============================================================
+
+services:
+  # --------------------------------------------------------
+  # 核心推理服务: llama-server (纯 C++，OpenAI 兼容 API)
+  # --------------------------------------------------------
+  llama-server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.server
+      args:
+        - CUDA_VERSION=12.4
+        - LLAMA_VERSION=b5353
+    image: llama-server:latest
+    container_name: llama-server
+    restart: unless-stopped
+
+    # NVIDIA GPU 支持 (需要 nvidia-docker2)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    environment:
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+      - GGML_CUDA_NO_PINNED=1
+      - GGML_CUDA_FORCE_MMQ=1
+      - HF_TOKEN=${HF_TOKEN}
+      - HF_HOME=/root/.cache/huggingface
+
+    volumes:
+      # 本地模型目录 (只读挂载)
+      - ./models:/models:ro
+      # Hugging Face 缓存共享
+      - hf-cache:/root/.cache/huggingface
+      # 日志持久化
+      - ./logs:/var/log/llama-server
+
+    ports:
+      - "${LLAMA_PORT:-8080}:8080"
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    # 生产级启动参数
+    command: >
+      --models /models/models.ini
+      --host 0.0.0.0
+      --port 8080
+      --n-gpu-layers ${GPU_LAYERS:-999}
+      --ctx-size ${CTX_SIZE:-32768}
+      --batch-size ${BATCH_SIZE:-2048}
+      --ubatch-size ${UBATCH_SIZE:-512}
+      --parallel ${PARALLEL:-4}
+      --threads-http ${HTTP_THREADS:-4}
+      --threads-batch ${BATCH_THREADS:-4}
+      --timeout ${TIMEOUT:-300}
+      --metrics
+      ${FLASH_ATTN:+--flash-attn}
+      ${API_KEY:+--api-key ${API_KEY}}
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+    # 资源限制 (生产环境建议启用)
+    # mem_limit: 32g
+    # cpus: '16'
+
+  # --------------------------------------------------------
+  # 监控: Prometheus
+  # --------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: prometheus
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+
+  # --------------------------------------------------------
+  # 可视化: Grafana
+  # --------------------------------------------------------
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=${GRAFANA_URL:-http://localhost:3000}
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./monitoring/dashboards:/etc/grafana/provisioning/dashboards:ro
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus
+
+  # --------------------------------------------------------
+  # 反向代理: Nginx (SSL + 负载均衡)
+  # --------------------------------------------------------
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: llama-nginx
+    restart: unless-stopped
+    ports:
+      - "${NGINX_HTTP_PORT:-80}:80"
+      - "${NGINX_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - llama-server
+    profiles:
+      - with-nginx  # 可选启用: docker-compose --profile with-nginx up -d
+
+volumes:
+  hf-cache:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+
+# ============================================================
+# 网络配置
+# ============================================================
+networks:
+  default:
+    name: llama-infra
+    driver: bridge

@@ -1,0 +1,476 @@
+# ============================================================
+# GitHub Actions CI/CD 流水线
+# 
+# 流水线阶段:
+#   1. download  - 从 Hugging Face Hub 下载模型
+#   2. convert   - 转换为 GGUF 格式 (F16)
+#   3. quantize  - 量化压缩 (Q4_K_M/Q8_0 等)
+#   4. verify    - 模型验证和基准测试
+#   5. build     - 构建 Docker 镜像
+#   6. deploy    - 部署到生产服务器
+#
+# 触发方式:
+#   - workflow_dispatch: 手动触发 (带参数)
+#   - schedule:          定时触发 (每周检查更新)
+#   - push:              代码推送时触发
+# ============================================================
+
+name: Llama.cpp 模型部署流水线
+
+on:
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      model_repo:
+        description: 'Hugging Face 模型仓库 ID'
+        required: true
+        default: 'meta-llama/Llama-3.1-8B-Instruct'
+        type: string
+      
+      quant_type:
+        description: '量化类型'
+        required: true
+        default: 'Q4_K_M'
+        type: choice
+        options:
+          - Q4_K_M
+          - Q5_K_M
+          - Q6_K
+          - Q8_0
+          - IQ4_XS
+          - F16
+      
+      ctx_size:
+        description: '上下文长度'
+        required: true
+        default: '32768'
+        type: choice
+        options:
+          - '8192'
+          - '16384'
+          - '32768'
+          - '65536'
+          - '131072'
+      
+      skip_tests:
+        description: '跳过基准测试'
+        required: false
+        default: false
+        type: boolean
+
+  # 定时检查更新 (每周一凌晨 2 点)
+  schedule:
+    - cron: '0 2 * * 1'
+
+  # 代码推送时触发 (仅 main 分支的 ci/ 或 docker/ 目录变更)
+  push:
+    branches: [main]
+    paths:
+      - 'docker/**'
+      - '.github/workflows/**'
+      - 'scripts/**'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: llama-server
+
+jobs:
+  # ========================================================
+  # Stage 1: 下载模型
+  # ========================================================
+  download:
+    name: 下载模型
+    runs-on: ubuntu-latest
+    
+    outputs:
+      model_name: ${{ steps.meta.outputs.model_name }}
+      model_repo: ${{ steps.meta.outputs.model_repo }}
+      quant_type: ${{ steps.meta.outputs.quant_type }}
+      cache_key: ${{ steps.meta.outputs.cache_key }}
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install huggingface_hub hf_transfer
+          echo "HF_HUB_ENABLE_HF_TRANSFER=1" >> $GITHUB_ENV
+
+      - name: 提取模型信息
+        id: meta
+        run: |
+          MODEL_REPO="${{ github.event.inputs.model_repo || 'meta-llama/Llama-3.1-8B-Instruct' }}"
+          QUANT="${{ github.event.inputs.quant_type || 'Q4_K_M' }}"
+          
+          # 生成安全的模型名 (替换 / 为 -)
+          MODEL_NAME=$(echo "$MODEL_REPO" | tr '/' '-')
+          CACHE_KEY="${MODEL_NAME}-${QUANT}"
+          
+          echo "model_repo=$MODEL_REPO" >> $GITHUB_OUTPUT
+          echo "model_name=$MODEL_NAME" >> $GITHUB_OUTPUT
+          echo "quant_type=$QUANT" >> $GITHUB_OUTPUT
+          echo "cache_key=$CACHE_KEY" >> $GITHUB_OUTPUT
+          
+          echo "========================================"
+          echo "模型: $MODEL_REPO"
+          echo "量化: $QUANT"
+          echo "Cache Key: $CACHE_KEY"
+          echo "========================================"
+
+      - name: 检查模型缓存
+        id: cache-check
+        uses: actions/cache@v4
+        with:
+          path: ./models/hf-model
+          key: hf-model-${{ steps.meta.outputs.model_repo }}-${{ hashFiles('scripts/download-model.py') }}
+
+      - name: 下载模型
+        if: steps.cache-check.outputs.cache-hit != 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python scripts/download-model.py \
+            --repo-id "${{ steps.meta.outputs.model_repo }}" \
+            --output ./models/hf-model
+
+      - name: 上传模型产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: hf-model
+          path: ./models/hf-model/
+          retention-days: 1
+
+  # ========================================================
+  # Stage 2: 转换为 GGUF (F16)
+  # ========================================================
+  convert:
+    name: 转换为 GGUF
+    runs-on: ubuntu-latest
+    needs: download
+    
+    outputs:
+      f16_filename: ${{ steps.convert.outputs.f16_filename }}
+    
+    steps:
+      - name: 检出 llama.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: b5353
+          path: llama.cpp
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          pip install -r llama.cpp/requirements.txt
+
+      - name: 下载模型产物
+        uses: actions/download-artifact@v4
+        with:
+          name: hf-model
+          path: ./models/hf-model
+
+      - name: 执行转换
+        id: convert
+        run: |
+          MODEL_NAME="${{ needs.download.outputs.model_name }}"
+          F16_FILE="${MODEL_NAME}-f16.gguf"
+          
+          python llama.cpp/convert_hf_to_gguf.py \
+            ./models/hf-model \
+            --outfile "./models/${F16_FILE}" \
+            --outtype f16 \
+            --verbose
+          
+          echo "f16_filename=${F16_FILE}" >> $GITHUB_OUTPUT
+          ls -lh "./models/${F16_FILE}"
+
+      - name: 上传 F16 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-f16
+          path: "./models/${{ needs.download.outputs.model_name }}-f16.gguf"
+          retention-days: 1
+
+  # ========================================================
+  # Stage 3: 量化
+  # ========================================================
+  quantize:
+    name: 量化压缩
+    runs-on: ubuntu-latest
+    needs: [download, convert]
+    
+    outputs:
+      final_model: ${{ steps.quant.outputs.final_model }}
+    
+    steps:
+      - name: 检出 llama.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: b5353
+          path: llama.cpp
+
+      - name: 编译量化工具
+        run: |
+          sudo apt-get update && sudo apt-get install -y cmake build-essential
+          cmake -B llama.cpp/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_BUILD_SERVER=OFF
+          cmake --build llama.cpp/build --config Release -j$(nproc)
+
+      - name: 下载 F16 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: model-f16
+          path: ./models/
+
+      - name: 执行量化
+        id: quant
+        run: |
+          MODEL_NAME="${{ needs.download.outputs.model_name }}"
+          QUANT="${{ needs.download.outputs.quant_type }}"
+          F16_FILE="./models/${MODEL_NAME}-f16.gguf"
+          OUTPUT_FILE="./models/${MODEL_NAME}-${QUANT}.gguf"
+          
+          ./llama.cpp/build/bin/llama-quantize \
+            "$F16_FILE" \
+            "$OUTPUT_FILE" \
+            "$QUANT"
+          
+          echo "final_model=${MODEL_NAME}-${QUANT}.gguf" >> $GITHUB_OUTPUT
+          
+          echo "========================================"
+          echo "量化完成:"
+          ls -lh "$OUTPUT_FILE"
+          echo "========================================"
+
+      - name: 上传量化模型
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-quantized
+          path: "./models/${{ needs.download.outputs.model_name }}-${{ needs.download.outputs.quant_type }}.gguf"
+          retention-days: 7
+
+  # ========================================================
+  # Stage 4: 验证和基准测试
+  # ========================================================
+  verify:
+    name: 验证和基准测试
+    runs-on: ubuntu-latest
+    needs: [download, convert, quantize]
+    if: ${{ !github.event.inputs.skip_tests }}
+    
+    steps:
+      - name: 检出 llama.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: b5353
+          path: llama.cpp
+
+      - name: 编译 llama-cli
+        run: |
+          sudo apt-get update && sudo apt-get install -y cmake build-essential
+          cmake -B llama.cpp/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_BUILD_SERVER=OFF
+          cmake --build llama.cpp/build --config Release -j$(nproc)
+
+      - name: 下载量化模型
+        uses: actions/download-artifact@v4
+        with:
+          name: model-quantized
+          path: ./models/
+
+      - name: 验证模型元数据
+        run: |
+          MODEL="./models/${{ needs.quantize.outputs.final_model }}"
+          echo "模型元数据:"
+          ./llama.cpp/build/bin/llama-gguf-dump "$MODEL" | head -30
+
+      - name: Smoke Test (推理测试)
+        run: |
+          MODEL="./models/${{ needs.quantize.outputs.final_model }}"
+          echo "执行推理 smoke test..."
+          ./llama.cpp/build/bin/llama-cli \
+            -m "$MODEL" \
+            -p "The capital of France is" \
+            -n 5 \
+            --temp 0.0 \
+            --no-display-prompt
+
+      - name: 基准测试
+        run: |
+          MODEL="./models/${{ needs.quantize.outputs.final_model }}"
+          echo "执行基准测试..."
+          ./llama.cpp/build/bin/llama-bench \
+            -m "$MODEL" \
+            -p 512,1024,2048 \
+            -n 128 \
+            --repetitions 3 \
+            -o json > benchmark-results.json
+          
+          echo "========================================"
+          echo "基准测试结果:"
+          cat benchmark-results.json
+          echo "========================================"
+
+      - name: 上传基准测试结果
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark-results.json
+
+  # ========================================================
+  # Stage 5: 构建 Docker 镜像
+  # ========================================================
+  build:
+    name: 构建 Docker 镜像
+    runs-on: ubuntu-latest
+    needs: [download, quantize]
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 下载量化模型
+        uses: actions/download-artifact@v4
+        with:
+          name: model-quantized
+          path: ./models/
+
+      - name: 准备模型文件
+        run: |
+          mkdir -p docker/models
+          cp "./models/${{ needs.quantize.outputs.final_model }}" docker/models/model.gguf
+          
+          # 创建 models.ini
+          cat > docker/models/models.ini << EOF
+[*]
+n-gpu-layers = all
+ctx-size = ${{ github.event.inputs.ctx_size || '32768' }}
+parallel = 4
+
+[default]
+model = /models/model.gguf
+chat-template = llama3
+EOF
+
+      - name: 构建并推送镜像
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.server
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ needs.download.outputs.cache_key }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            LLAMA_VERSION=b5353
+
+      - name: 输出镜像信息
+        run: |
+          echo "镜像地址: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ needs.download.outputs.cache_key }}"
+          echo "Latest:   ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest"
+
+  # ========================================================
+  # Stage 6: 部署到生产服务器
+  # ========================================================
+  deploy:
+    name: 部署到生产环境
+    runs-on: ubuntu-latest
+    needs: [download, quantize, build]
+    if: (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') && vars.DEPLOY_HOST != ''
+    
+    environment: production
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 部署到远程服务器
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ vars.DEPLOY_HOST }}
+          username: ${{ vars.DEPLOY_USER || 'deploy' }}
+          key: ${{ secrets.DEPLOY_KEY }}
+          port: ${{ vars.DEPLOY_PORT || '22' }}
+          script: |
+            set -e
+            echo "========================================"
+            echo "开始部署 llama-server"
+            echo "========================================"
+            
+            cd /opt/llama-server || exit 1
+            
+            # 拉取最新镜像
+            docker pull ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+            
+            # 更新 docker-compose 中的镜像标签
+            sed -i "s|image: llama-server:.*|image: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest|" docker-compose.yml
+            
+            # 重启服务
+            docker-compose up -d --force-recreate llama-server
+            
+            # 等待服务就绪
+            echo "等待服务启动..."
+            for i in {1..30}; do
+              if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+                echo "服务启动成功!"
+                break
+              fi
+              echo -n "."
+              sleep 2
+            done
+            
+            # 健康检查
+            echo ""
+            echo "健康检查:"
+            curl -s http://localhost:8080/health | python3 -m json.tool || true
+            
+            echo ""
+            echo "当前运行模型:"
+            curl -s http://localhost:8080/v1/models | python3 -m json.tool || true
+            
+            echo "========================================"
+            echo "部署完成!"
+            echo "========================================"
+
+      - name: 通知部署状态
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✅ 部署成功"
+          else
+            echo "❌ 部署失败"
+          fi

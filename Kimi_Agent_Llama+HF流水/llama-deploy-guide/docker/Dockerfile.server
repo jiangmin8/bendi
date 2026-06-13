@@ -1,0 +1,110 @@
+# ============================================================
+# Dockerfile.server - llama-server 生产镜像
+# 多阶段构建: 编译阶段 → 运行阶段
+# 支持 CUDA + Vulkan 后端
+# ============================================================
+
+# --------------------------------------------------
+# Stage 1: 编译环境
+# --------------------------------------------------
+FROM nvidia/cuda:12.4-devel-ubuntu22.04 AS builder
+
+LABEL maintainer="llama-deploy"
+LABEL description="llama-server production build with CUDA and Vulkan support"
+
+WORKDIR /build
+
+# 安装编译依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    cmake \
+    build-essential \
+    libcurl4-openssl-dev \
+    libvulkan-dev \
+    vulkan-tools \
+    pkg-config \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# 克隆 llama.cpp (可通过 build-arg 指定版本)
+ARG LLAMA_VERSION=b5353
+RUN git clone --depth 1 --branch ${LLAMA_VERSION} \
+    https://github.com/ggml-org/llama.cpp.git
+
+WORKDIR /build/llama.cpp
+
+# 编译配置:
+# - CUDA: NVIDIA GPU 加速
+# - Vulkan: AMD/Intel GPU 支持
+# - SERVER: 构建 llama-server
+# - NATIVE=OFF: 确保可移植性（不针对宿主机 CPU 优化）
+# - BACKEND_DL: 动态后端加载
+RUN cmake -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DLLAMA_BUILD_SERVER=ON \
+    -DLLAMA_CURL=ON \
+    -DGGML_CUDA=ON \
+    -DGGML_VULKAN=ON \
+    -DGGML_NATIVE=OFF \
+    -DGGML_BACKEND_DL=ON \
+    -DGGML_F16C=ON \
+    -DCMAKE_CUDA_ARCHITECTURES="native" \
+    -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++" \
+    && cmake --build build --config Release -j$(nproc)
+
+# 验证编译产物
+RUN ls -la build/bin/ && \
+    build/bin/llama-server --version
+
+# --------------------------------------------------
+# Stage 2: 运行环境 (最小化)
+# --------------------------------------------------
+FROM nvidia/cuda:12.4-runtime-ubuntu22.04 AS runtime
+
+WORKDIR /app
+
+# 安装运行时依赖 (最小集)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libcurl4 \
+    libgomp1 \
+    libvulkan1 \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# 从编译阶段复制二进制文件
+COPY --from=builder /build/llama.cpp/build/bin/llama-server /usr/local/bin/
+COPY --from=builder /build/llama.cpp/build/bin/llama-quantize /usr/local/bin/
+COPY --from=builder /build/llama.cpp/build/bin/llama-bench /usr/local/bin/
+COPY --from=builder /build/llama.cpp/build/bin/llama-cli /usr/local/bin/
+COPY --from=builder /build/llama.cpp/build/bin/llama-gguf-dump /usr/local/bin/
+COPY --from=builder /build/llama.cpp/build/bin/llama-imatrix /usr/local/bin/
+
+# 复制动态后端库
+COPY --from=builder /build/llama.cpp/build/bin/libggml-*.so /usr/local/lib/ 2>/dev/null || true
+COPY --from=builder /build/llama.cpp/build/bin/libggml*.so /usr/local/lib/ 2>/dev/null || true
+RUN ldconfig 2>/dev/null || true
+
+# 创建非 root 用户 (安全最佳实践)
+RUN groupadd -r llama && useradd -r -g llama -s /bin/false llama
+
+# 创建必要的目录
+RUN mkdir -p /models /var/log/llama-server && \
+    chown -R llama:llama /app /var/log/llama-server
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -sf http://localhost:8080/health || exit 1
+
+# 暴露端口
+EXPOSE 8080
+
+# 使用非 root 用户运行 (可选，如需要 GPU 权限可能需要 root)
+# USER llama
+
+# 入口点
+ENTRYPOINT ["llama-server"]
+
+# 默认参数 (可在 docker-compose 或命令行覆盖)
+CMD ["--help"]
